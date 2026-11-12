@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 import urllib.parse
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -19,9 +20,10 @@ import yaml
 
 # ==================== 可调核心参数 ====================
 MAX_CANDIDATES_TO_TEST = 2200   # 单次送入真机内核测速的最大去重候选数
-MAX_ACCEPT_DELAY_MS = 1800      # 最大允许真连接延迟 (毫秒)，超过视为慢/死节点剔除
-TEST_CONCURRENCY = 90           # Mihomo 内核并发真连接测速协程数
-TEST_TARGET_URL = "https://cp.cloudflare.com/generate_204"
+TEST_TIMEOUT_MS = 5000          # Mihomo 单节点握手+测速超时上限 (毫秒)
+MAX_ACCEPT_DELAY_MS = 3200      # 保留的最大延迟 (兼顾美国服务器跨洋测香港/日本节点的往返耗时)
+TEST_CONCURRENCY = 70           # 并发真连接测速数
+TEST_TARGET_URL = "https://www.gstatic.com/generate_204"
 MIHOMO_API = "http://127.0.0.1:19090"
 
 GITHUB_SEARCH_KEYWORDS = [
@@ -48,7 +50,6 @@ SEED_URLS = [
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge_base64.txt",
 ]
 
-# 多通道竞速镜像（直连受阻时自动并发抢答）
 FETCH_ROUTES = [
     lambda u: u,
     lambda u: f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(u, safe='')}",
@@ -94,15 +95,12 @@ def expand_date_urls(tpl: str) -> List[str]:
     if "{YYYY}" not in tpl and "{MM}" not in tpl and "{DD}" not in tpl:
         return [tpl]
     now = datetime.now(timezone.utc)
-    res = []
-    for d in (now, now - timedelta(days=1)):
-        u = (
-            tpl.replace("{YYYY}", d.strftime("%Y"))
-            .replace("{MM}", d.strftime("%m"))
-            .replace("{DD}", d.strftime("%d"))
-        )
-        res.append(u)
-    return res
+    return [
+        tpl.replace("{YYYY}", d.strftime("%Y"))
+        .replace("{MM}", d.strftime("%m"))
+        .replace("{DD}", d.strftime("%d"))
+        for d in (now, now - timedelta(days=1))
+    ]
 
 
 def clash_dict_to_uri(p: dict) -> Optional[str]:
@@ -117,10 +115,8 @@ def clash_dict_to_uri(p: dict) -> Optional[str]:
 
     if ptype == "trojan" and p.get("password"):
         sni = p.get("sni") or p.get("servername") or ""
-        q = f"security=tls&sni={urllib.parse.quote(str(sni))}" if sni else "security=tls"
-        if p.get("skip-cert-verify"):
-            q += "&allowInsecure=1"
-        return f"trojan://{urllib.parse.quote(str(p['password']))}@{server}:{port}?{q}#{name}"
+        q = f"security=tls&allowInsecure=1&sni={urllib.parse.quote(str(sni))}" if sni else "security=tls&allowInsecure=1"
+        return f"trojan://{urllib.parse.quote(str(p['password']))}@{server}:${port}?{q}#{name}".replace("${port}", port)
 
     if ptype == "ss" and p.get("cipher") and p.get("password"):
         userinfo = b64_encode_urlsafe_nopad(f"{p['cipher']}:{p['password']}")
@@ -133,6 +129,8 @@ def clash_dict_to_uri(p: dict) -> Optional[str]:
         sec = "reality" if ropts else ("tls" if tls_enabled else "none")
         sni = p.get("servername") or p.get("sni") or ""
         params = {"encryption": "none", "security": sec, "type": net}
+        if sec == "tls":
+            params["allowInsecure"] = "1"
         if sni:
             params["sni"] = str(sni)
         if p.get("client-fingerprint"):
@@ -173,7 +171,7 @@ def clash_dict_to_uri(p: dict) -> Optional[str]:
         return "vmess://" + b64_encode_str(json.dumps(vobj, ensure_ascii=False))
 
     if ptype in ("hysteria2", "hy2") and p.get("password"):
-        params = {"insecure": "1" if p.get("skip-cert-verify", True) else "0"}
+        params = {"insecure": "1"}
         if p.get("sni"):
             params["sni"] = str(p["sni"])
         if p.get("obfs"):
@@ -184,7 +182,7 @@ def clash_dict_to_uri(p: dict) -> Optional[str]:
         return f"hysteria2://{urllib.parse.quote(str(p['password']))}@{server}:{port}?{qs}#{name}"
 
     if ptype == "tuic" and p.get("uuid") and p.get("password"):
-        params = {"congestion_control": str(p.get("congestion-controller", "bbr"))}
+        params = {"congestion_control": str(p.get("congestion-controller", "bbr")), "allow_insecure": "1"}
         if p.get("sni"):
             params["sni"] = str(p["sni"])
         if p.get("alpn"):
@@ -239,10 +237,6 @@ def harvest_from_text(raw: str) -> Tuple[List[str], List[str]]:
 
 # ==================== 节点清洗、打标与重写 ====================
 def inspect_and_rewrite_candidate(uri: str, tag_id: str) -> Optional[Tuple[str, str, str]]:
-    """
-    返回: (fingerprint, tagged_uri_for_mihomo, original_clean_remark)
-    若为假节点、广告或损坏格式则返回 None
-    """
     m = re.match(r"^([a-z0-9]+)://(.+)$", uri.strip(), re.I)
     if not m:
         return None
@@ -298,7 +292,6 @@ def inspect_and_rewrite_candidate(uri: str, tag_id: str) -> Optional[Tuple[str, 
         tagged_ssr = "ssr://" + b64_encode_urlsafe_nopad(f"{main_part}/?{flat_q}")
         return f"ssr://{main_part}", tagged_ssr, orig_name
 
-    # vless / trojan / ss / hy2 / hysteria2 / tuic
     norm_proto = "hysteria2" if proto == "hy2" else proto
     if "#" in body:
         main_part, raw_remark = body.split("#", 1)
@@ -378,7 +371,7 @@ async def race_fetch_text(session: aiohttp.ClientSession, url: str) -> Optional[
 
 
 async def discover_github_sources(session: aiohttp.ClientSession) -> List[str]:
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "NodeHunterBot/3.0"}
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "NodeHunterBot/3.1"}
     gh_token = os.getenv("GITHUB_TOKEN", "").strip()
     if gh_token:
         headers["Authorization"] = f"Bearer {gh_token}"
@@ -427,7 +420,7 @@ async def discover_github_sources(session: aiohttp.ClientSession) -> List[str]:
     return list(found)
 
 
-# ==================== Mihomo 真机内核握手测速 ====================
+# ==================== Mihomo 真机内核握手测速（兼容 v1.19.26+ Provider API） ====================
 async def test_nodes_with_mihomo(mihomo_bin: Path, tagged_uris: List[str]) -> Dict[str, int]:
     work_dir = Path("./mihomo_work")
     if work_dir.exists():
@@ -441,13 +434,33 @@ async def test_nodes_with_mihomo(mihomo_bin: Path, tagged_uris: List[str]) -> Di
         "mixed-port": 17890,
         "allow-lan": False,
         "mode": "rule",
-        "log-level": "silent",
+        "log-level": "warning",
         "ipv6": False,
+        "unified-delay": True,
+        "tcp-concurrent": True,
         "external-controller": "127.0.0.1:19090",
+        "dns": {
+            "enable": True,
+            "ipv6": False,
+            "nameserver": ["8.8.8.8", "1.1.1.1"],
+            "proxy-server-nameserver": ["8.8.8.8", "1.1.1.1"],
+        },
         "proxy-providers": {
             "hunter_pool": {
                 "type": "file",
                 "path": "./candidates.txt",
+                "health-check": {
+                    "enable": True,
+                    "url": TEST_TARGET_URL,
+                    "interval": 3600,
+                    "timeout": TEST_TIMEOUT_MS,
+                    "lazy": True,
+                    "expected-status": "200/204",
+                },
+                "override": {
+                    "skip-cert-verify": True,
+                    "udp": True,
+                },
             }
         },
         "proxy-groups": [
@@ -462,21 +475,27 @@ async def test_nodes_with_mihomo(mihomo_bin: Path, tagged_uris: List[str]) -> Di
     cfg_path = work_dir / "config.yaml"
     cfg_path.write_text(yaml.safe_dump(mihomo_cfg, sort_keys=False), encoding="utf-8")
 
+    err_log_path = work_dir / "mihomo_stderr.log"
+    err_fp = open(err_log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
         [str(mihomo_bin.resolve()), "-d", str(work_dir.resolve()), "-f", str(cfg_path.resolve())],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=err_fp,
     )
 
     alive_delays: Dict[str, int] = {}
+    status_counter: Counter = Counter()
+
     try:
-        async with aiohttp.ClientSession() as session:
-            # 等待 Mihomo REST API 启动就绪
+        conn = aiohttp.TCPConnector(limit=TEST_CONCURRENCY + 20)
+        async with aiohttp.ClientSession(connector=conn) as session:
             ready = False
-            for _ in range(30):
+            for _ in range(35):
                 try:
                     async with session.get(f"{MIHOMO_API}/version", timeout=aiohttp.ClientTimeout(total=1)) as r:
                         if r.status == 200:
+                            ver = await r.json()
+                            print(f"[Mihomo 内核] 启动就绪，当前版本: {ver.get('version', 'unknown')}")
                             ready = True
                             break
                 except Exception:
@@ -484,12 +503,13 @@ async def test_nodes_with_mihomo(mihomo_bin: Path, tagged_uris: List[str]) -> Di
                 await asyncio.sleep(0.3)
 
             if not ready:
-                print("[Mihomo 测速] 错误：控制接口未能在预期时间内启动")
+                err_fp.flush()
+                err_txt = err_log_path.read_text(encoding="utf-8", errors="ignore")[-800:]
+                print(f"[Mihomo 测速] 错误：控制接口未就绪，内核日志: {err_txt}")
                 return {}
 
-            # 触发加载并读取所有被内核成功识别的节点名
             await session.put(f"{MIHOMO_API}/providers/proxies/hunter_pool")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.6)
             async with session.get(f"{MIHOMO_API}/providers/proxies/hunter_pool") as resp:
                 pdata = await resp.json()
                 loaded_names = [
@@ -498,26 +518,60 @@ async def test_nodes_with_mihomo(mihomo_bin: Path, tagged_uris: List[str]) -> Di
                     if str(p.get("name", "")).startswith("NODE_")
                 ]
 
-            print(f"[Mihomo 测速] 内核成功装载 {len(loaded_names)} 个合法节点，开始并发 HTTPS 204 真连接验活...")
+            total_loaded = len(loaded_names)
+            print(f"[Mihomo 测速] 内核成功装载 {total_loaded} 个合法节点，开始并发 204 真连接验活...")
+            if total_loaded == 0:
+                return {}
 
-            sem = asyncio.Semaphore(TEST_CONCURRENCY)
             encoded_target = urllib.parse.quote(TEST_TARGET_URL, safe="")
 
+            # 自动探测新版 Provider 专属测速路由 vs 旧版全局路由
+            use_provider_route = True
+            probe_name = urllib.parse.quote(loaded_names[0], safe="")
+            probe_url = f"{MIHOMO_API}/providers/proxies/hunter_pool/{probe_name}/healthcheck?url={encoded_target}&timeout=3000"
+            try:
+                async with session.get(probe_url, timeout=aiohttp.ClientTimeout(total=5)) as pr:
+                    if pr.status == 404:
+                        use_provider_route = False
+                        print("[路由自适应] 检测到旧版路由模式，切换至 /proxies/{name}/delay")
+                    else:
+                        print(f"[路由自适应] 命中新版 Provider 测速接口 (探测状态码 HTTP {pr.status})")
+            except Exception:
+                pass
+
+            sem = asyncio.Semaphore(TEST_CONCURRENCY)
+            completed = 0
+
             async def check_one(node_name: str):
-                url = f"{MIHOMO_API}/proxies/{node_name}/delay?url={encoded_target}&timeout={MAX_ACCEPT_DELAY_MS + 600}"
+                nonlocal completed
+                q_name = urllib.parse.quote(node_name, safe="")
+                if use_provider_route:
+                    url = f"{MIHOMO_API}/providers/proxies/hunter_pool/{q_name}/healthcheck?url={encoded_target}&timeout={TEST_TIMEOUT_MS}"
+                else:
+                    url = f"{MIHOMO_API}/proxies/{q_name}/delay?url={encoded_target}&timeout={TEST_TIMEOUT_MS}"
+
                 async with sem:
                     try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=(TEST_TIMEOUT_MS / 1000) + 3)) as r:
+                            status_counter[f"HTTP_{r.status}"] += 1
                             if r.status == 200:
                                 j = await r.json()
                                 delay = int(j.get("delay", 0))
                                 if 0 < delay <= MAX_ACCEPT_DELAY_MS:
                                     alive_delays[node_name] = delay
+                    except asyncio.TimeoutError:
+                        status_counter["CLIENT_TIMEOUT"] += 1
                     except Exception:
-                        pass
+                        status_counter["CLIENT_ERR"] += 1
+                    finally:
+                        completed += 1
+                        if completed % 400 == 0 or completed == total_loaded:
+                            print(f"[测速进度] {completed} / {total_loaded} 已测 | 当前真连接存活: {len(alive_delays)} 个")
 
             await asyncio.gather(*(check_one(n) for n in loaded_names))
+            print(f"[测速状态码分布] {dict(status_counter)}")
     finally:
+        err_fp.close()
         proc.terminate()
         try:
             proc.wait(timeout=4)
@@ -529,9 +583,6 @@ async def test_nodes_with_mihomo(mihomo_bin: Path, tagged_uris: List[str]) -> Di
 
 
 def generate_clash_client_yaml(b64_sub_rel_note: str) -> str:
-    """
-    生成开箱即用的 Mihomo / Clash Meta 配置（直接内嵌 proxy-providers 引用同目录订阅或独立使用）
-    """
     repo = os.getenv("GITHUB_REPOSITORY", "yourname/yourrepo")
     branch = os.getenv("GITHUB_REF_NAME", "main")
     raw_sub_url = f"https://raw.githubusercontent.com/{repo}/{branch}/sub/sub_base64.txt"
@@ -552,7 +603,11 @@ def generate_clash_client_yaml(b64_sub_rel_note: str) -> str:
                 "health-check": {
                     "enable": True,
                     "interval": 300,
-                    "url": "https://cp.cloudflare.com/generate_204",
+                    "url": "https://www.gstatic.com/generate_204",
+                },
+                "override": {
+                    "skip-cert-verify": True,
+                    "udp": True,
                 },
             }
         },
@@ -567,7 +622,7 @@ def generate_clash_client_yaml(b64_sub_rel_note: str) -> str:
                 "name": "⚡ 自动最优",
                 "type": "url-test",
                 "use": ["VerifiedNodes"],
-                "url": "https://cp.cloudflare.com/generate_204",
+                "url": "https://www.gstatic.com/generate_204",
                 "interval": 300,
                 "tolerance": 50,
             },
@@ -575,7 +630,7 @@ def generate_clash_client_yaml(b64_sub_rel_note: str) -> str:
                 "name": "🛡️ 故障转移",
                 "type": "fallback",
                 "use": ["VerifiedNodes"],
-                "url": "https://cp.cloudflare.com/generate_204",
+                "url": "https://www.gstatic.com/generate_204",
                 "interval": 300,
             },
         ],
@@ -639,7 +694,7 @@ async def main():
 
     print(f"[清洗去重] 原始共抓到 {len(raw_nodes)} 条毛坯记录，开始指纹去重与广告过滤...")
     seen_fp: Set[str] = set()
-    id_map: Dict[str, Tuple[str, str]] = {}  # tag_id -> (tagged_uri, orig_remark)
+    id_map: Dict[str, Tuple[str, str]] = {}
     tagged_list: List[str] = []
 
     for uri in raw_nodes:
@@ -665,12 +720,10 @@ async def main():
         print("[警告] 未检测到 ./mihomo 二进制文件，跳过真连接测速")
         alive_delays = {k: 999 for k in id_map}
 
-    # 按实测延迟从低到高排序输出
     sorted_alive = sorted(alive_delays.items(), key=lambda kv: kv[1])
     final_uris: List[str] = []
     for tag_id, delay_ms in sorted_alive:
         tagged_uri, orig_remark = id_map[tag_id]
-        # 剥离旧的延迟前缀，写入本次最新实测延迟
         clean_orig = re.sub(r"^⚡\d+ms\s*\|\s*", "", orig_remark).strip()
         final_uris.append(apply_final_remark(tagged_uri, f"⚡{delay_ms}ms | {clean_orig}"))
 
