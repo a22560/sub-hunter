@@ -1,0 +1,45 @@
+# 自动更新真机验活配置 (更新于 2026-11-12 16:00:30 CST · 存活 286 节点)
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+unified-delay: true
+tcp-concurrent: true
+proxy-providers:
+  VerifiedNodes:
+    type: http
+    url: https://raw.githubusercontent.com/a22560/sub-hunter/main/sub/sub_base64.txt
+    interval: 3600
+    path: ./providers/verified_nodes.yaml
+    health-check:
+      enable: true
+      interval: 300
+      url: https://www.gstatic.com/generate_204
+    override:
+      skip-cert-verify: true
+      udp: true
+proxy-groups:
+- name: 🚀 节点选择
+  type: select
+  proxies:
+  - ⚡ 自动最优
+  - 🛡️ 故障转移
+  use:
+  - VerifiedNodes
+- name: ⚡ 自动最优
+  type: url-test
+  use:
+  - VerifiedNodes
+  url: https://www.gstatic.com/generate_204
+  interval: 300
+  tolerance: 50
+- name: 🛡️ 故障转移
+  type: fallback
+  use:
+  - VerifiedNodes
+  url: https://www.gstatic.com/generate_204
+  interval: 300
+rules:
+- GEOIP,LAN,DIRECT,no-resolve
+- GEOIP,CN,DIRECT
+- MATCH,🚀 节点选择
