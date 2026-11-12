@@ -1,0 +1,61 @@
+name: Auto Hunt & Real Speedtest Nodes
+
+on:
+  schedule:
+    # 每 4 小时全自动运行一次
+    - cron: "15 */4 * * *"
+  workflow_dispatch: # 支持在网页端随时手动点击 Run workflow 立即抓一波
+
+permissions:
+  contents: write # 赋予自动将测速后的订阅写回仓库的权限
+
+jobs:
+  hunt-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 1. 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 配置 Python 3.11 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 3. 安装异步爬虫依赖
+        run: pip install -r requirements.txt
+
+      - name: 4. 自动下载最新版 Mihomo (Clash.Meta) 真机测速内核
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
+          DL_URL=$(echo "$API_JSON" | jq -r '.assets[].browser_download_url' | grep -E 'mihomo-linux-amd64-compatible-v[0-9]+\.[0-9]+\.[0-9]+\.gz$' | head -n 1)
+          if [ -z "$DL_URL" ]; then
+            DL_URL=$(echo "$API_JSON" | jq -r '.assets[].browser_download_url' | grep -E 'mihomo-linux-amd64-v[0-9]+\.[0-9]+\.[0-9]+\.gz$' | head -n 1)
+          fi
+          echo "Downloading Mihomo core: $DL_URL"
+          curl -sL "$DL_URL" -o mihomo.gz
+          gunzip -f mihomo.gz
+          chmod +x mihomo
+          ./mihomo -v
+
+      - name: 5. 执行全网狩猎 + Mihomo 真连接 HTTPS 204 测速
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python hunter_check.py
+
+      - name: 6. 自动提交并更新订阅文件
+        run: |
+          if [ -d "sub" ] && [ -n "$(git status --porcelain sub/)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add sub/
+            git commit -m "chore(sub): update verified live nodes [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          else
+            echo "订阅无变动或本轮无新存活节点，跳过提交"
+          fi
